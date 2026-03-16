@@ -1,0 +1,11 @@
+{
+  "name": "paperclip-remote-proxy",
+  "version": "1.0.0",
+  "description": "A minimal proxy to run Paperclip agents (Claude/Cursor) on a remote machine",
+  "main": "proxy.js",
+  "type": "module",
+  "scripts": {
+    "start": "node proxy.js"
+  },
+  "dependencies": {}
+}
