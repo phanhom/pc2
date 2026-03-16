@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { parseArgs } from "node:util";
+import { networkInterfaces } from "node:os";
 
 // ==========================================
 // CLI Arguments
@@ -9,11 +10,6 @@ const { values: cliArgs } = parseArgs({
   options: {
     port: { type: "string", short: "p", default: process.env.PORT || "3101" },
     cwd: { type: "string", short: "d", default: process.cwd() },
-    adapter: {
-      type: "string",
-      short: "a",
-      default: "claude",
-    },
     help: { type: "boolean", short: "h", default: false },
   },
   strict: false,
@@ -30,14 +26,12 @@ Usage:
 Options:
   -p, --port <port>       Port to listen on (default: 3101, or $PORT)
   -d, --cwd <path>        Default working directory for agent execution
-  -a, --adapter <type>    Default adapter: claude | cursor | codex (default: claude)
   -h, --help              Show this help message
 
 Examples:
-  node proxy.js                          # Start with defaults (claude on port 3101)
-  node proxy.js -p 4000 -a cursor       # Cursor on port 4000
+  node proxy.js                          # Start on port 3101
+  node proxy.js -p 4000                  # Start on port 4000
   node proxy.js --cwd ~/projects         # Use ~/projects as default working directory
-  PORT=8080 node proxy.js               # Port from environment variable
 
 Environment Variables:
   PORT                    Listen port (overridden by --port)
@@ -49,7 +43,73 @@ Environment Variables:
 
 const PORT = Number(cliArgs.port);
 const DEFAULT_CWD = cliArgs.cwd;
-const DEFAULT_ADAPTER = cliArgs.adapter;
+
+// ==========================================
+// Environment Detection
+// ==========================================
+
+function commandExists(cmd) {
+  try {
+    execSync(`which ${cmd} 2>/dev/null`, { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getCommandVersion(cmd) {
+  try {
+    return execSync(`${cmd} --version 2>/dev/null`, { stdio: "pipe" }).toString().trim().split("\n")[0];
+  } catch {
+    return null;
+  }
+}
+
+function detectAdapters() {
+  const adapters = [
+    { name: "claude", command: "claude", label: "Claude Code" },
+    { name: "cursor", command: "cursor", label: "Cursor" },
+    { name: "codex", command: "codex", label: "Codex" },
+  ];
+
+  const results = [];
+  for (const adapter of adapters) {
+    const exists = commandExists(adapter.command);
+    const version = exists ? getCommandVersion(adapter.command) : null;
+    results.push({ ...adapter, available: exists, version });
+  }
+  return results;
+}
+
+function getLocalIPs() {
+  const interfaces = networkInterfaces();
+  const ips = [];
+  for (const [name, addrs] of Object.entries(interfaces)) {
+    if (!addrs) continue;
+    for (const addr of addrs) {
+      if (addr.family === "IPv4" && !addr.internal) {
+        ips.push({ name, address: addr.address });
+      }
+    }
+  }
+  return ips;
+}
+
+async function getPublicIP() {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const res = await fetch("https://api.ipify.org?format=json", { signal: controller.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json();
+      return data.ip;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
 
 // ==========================================
 // Adapter command builders
@@ -110,7 +170,7 @@ function resolveAdapter(payload) {
   if (configType.includes("claude")) return "claude";
   if (configType.includes("cursor")) return "cursor";
   if (configType.includes("codex")) return "codex";
-  return DEFAULT_ADAPTER;
+  return null;
 }
 
 // ==========================================
@@ -190,108 +250,188 @@ function parseClaudeUsage(stdout) {
 }
 
 // ==========================================
-// HTTP Server
+// Startup: detect environment, then start server
 // ==========================================
-const server = createServer(async (req, res) => {
-  // Health check
-  if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", adapter: DEFAULT_ADAPTER }));
-    return;
+async function main() {
+  console.log("");
+  console.log("╔══════════════════════════════════════════════════════╗");
+  console.log("║       Paperclip Remote Agent Proxy  v1.0.0          ║");
+  console.log("╚══════════════════════════════════════════════════════╝");
+  console.log("");
+
+  // --- Detect available adapters ---
+  console.log("  Detecting available agents...");
+  console.log("");
+  const adapters = detectAdapters();
+  let anyAvailable = false;
+
+  for (const a of adapters) {
+    if (a.available) {
+      anyAvailable = true;
+      const ver = a.version ? ` (${a.version})` : "";
+      console.log(`  ✅  ${a.label.padEnd(14)} found${ver}`);
+    } else {
+      console.log(`  ❌  ${a.label.padEnd(14)} not found — install to use ${a.label} (Remote)`);
+    }
   }
 
-  // Heartbeat endpoint
-  if (req.method === "POST" && req.url === "/heartbeat") {
-    let body = "";
-    req.on("data", (chunk) => { body += chunk.toString(); });
+  console.log("");
 
-    req.on("end", async () => {
-      try {
-        const payload = JSON.parse(body);
-        const { config = {}, context = {}, runId = "unknown" } = payload;
-        const adapterName = resolveAdapter(payload);
-        const builder = ADAPTERS[adapterName];
+  if (!anyAvailable) {
+    console.log("  ⚠️  No supported agents detected on this machine.");
+    console.log("     Install at least one of:");
+    console.log("       • Claude Code:  npm install -g @anthropic-ai/claude-code");
+    console.log("       • Cursor:       https://docs.cursor.com/cli");
+    console.log("       • Codex:        npm install -g @openai/codex");
+    console.log("");
+    console.log("     Starting anyway (will fail when heartbeat arrives)...");
+    console.log("");
+  }
 
-        console.log(`\n${"=".repeat(50)}`);
-        console.log(`[proxy] heartbeat received`);
-        console.log(`[proxy] adapter=${adapterName} agent=${payload.agentId} run=${runId}`);
+  // --- Detect network IPs ---
+  const localIPs = getLocalIPs();
+  const publicIP = await getPublicIP();
 
-        if (!builder) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: `Unknown adapter: ${adapterName}` }));
-          return;
-        }
+  console.log("  Network addresses:");
+  console.log("");
+  for (const ip of localIPs) {
+    console.log(`  🏠  LAN  ${ip.address.padEnd(18)} (${ip.name})`);
+  }
+  if (publicIP) {
+    console.log(`  🌐  WAN  ${publicIP}`);
+  }
+  if (localIPs.length === 0 && !publicIP) {
+    console.log("  ⚠️  Could not detect any network address");
+  }
 
-        const { command, args, prompt } = builder(config, runId);
-        const cwd = config.cwd || DEFAULT_CWD;
+  console.log("");
+  console.log("┌──────────────────────────────────────────────────────┐");
+  console.log("│  Ready! Use one of these URLs in Paperclip UI:      │");
+  console.log("│                                                      │");
+  for (const ip of localIPs) {
+    const url = `http://${ip.address}:${PORT}/heartbeat`;
+    console.log(`│  → ${url.padEnd(50)} │`);
+  }
+  if (publicIP) {
+    const url = `http://${publicIP}:${PORT}/heartbeat`;
+    console.log(`│  → ${url.padEnd(50)} │`);
+  }
+  if (localIPs.length === 0 && !publicIP) {
+    console.log(`│  → http://localhost:${PORT}/heartbeat${" ".repeat(50 - 26 - String(PORT).length)}│`);
+  }
+  console.log("│                                                      │");
+  console.log("│  CWD: " + DEFAULT_CWD.slice(0, 47).padEnd(47) + " │");
+  console.log("│                                                      │");
+  console.log("│  Available adapters:                                 │");
+  for (const a of adapters) {
+    const status = a.available ? "✅" : "❌";
+    console.log(`│    ${status}  ${a.label.padEnd(48)} │`);
+  }
+  console.log("└──────────────────────────────────────────────────────┘");
+  console.log("");
+  console.log("  Waiting for heartbeats from Paperclip Server...");
+  console.log("");
 
-        // Flatten env bindings (Paperclip stores them as { KEY: { type: "plain", value: "..." } })
-        const flatEnv = {};
-        if (config.env && typeof config.env === "object") {
-          for (const [key, val] of Object.entries(config.env)) {
-            if (typeof val === "string") {
-              flatEnv[key] = val;
-            } else if (val && typeof val === "object" && val.type === "plain") {
-              flatEnv[key] = val.value;
+  // --- Start HTTP server ---
+  const server = createServer(async (req, res) => {
+    // Health check
+    if (req.method === "GET" && req.url === "/health") {
+      const available = adapters.filter((a) => a.available).map((a) => a.name);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", adapters: available }));
+      return;
+    }
+
+    // Heartbeat endpoint
+    if (req.method === "POST" && req.url === "/heartbeat") {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk.toString(); });
+
+      req.on("end", async () => {
+        try {
+          const payload = JSON.parse(body);
+          const { config = {}, context = {}, runId = "unknown" } = payload;
+          const adapterName = resolveAdapter(payload);
+
+          console.log(`\n${"─".repeat(54)}`);
+          console.log(`[proxy] heartbeat received`);
+          console.log(`[proxy] adapter=${adapterName || "auto"} agent=${payload.agentId} run=${runId}`);
+
+          if (!adapterName || !ADAPTERS[adapterName]) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ exitCode: 1, errorMessage: `Unknown adapter type. Received: ${payload.config?.adapterType || payload.adapterType || "none"}` }));
+            return;
+          }
+
+          const adapterInfo = adapters.find((a) => a.name === adapterName);
+          if (adapterInfo && !adapterInfo.available) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              exitCode: 1,
+              errorMessage: `${adapterInfo.label} is not installed on this machine. Run: npm install -g ${adapterName === "claude" ? "@anthropic-ai/claude-code" : adapterName === "codex" ? "@openai/codex" : adapterName}`,
+            }));
+            return;
+          }
+
+          const builder = ADAPTERS[adapterName];
+          const { command, args, prompt } = builder(config, runId);
+          const cwd = config.cwd || DEFAULT_CWD;
+
+          // Flatten env bindings
+          const flatEnv = {};
+          if (config.env && typeof config.env === "object") {
+            for (const [key, val] of Object.entries(config.env)) {
+              if (typeof val === "string") {
+                flatEnv[key] = val;
+              } else if (val && typeof val === "object" && val.type === "plain") {
+                flatEnv[key] = val.value;
+              }
             }
           }
+
+          const agentEnv = {
+            ...process.env,
+            ...flatEnv,
+            PAPERCLIP_RUN_ID: runId,
+            PAPERCLIP_AGENT_ID: payload.agentId || "",
+            PAPERCLIP_COMPANY_ID: context.companyId || config.companyId || "",
+          };
+
+          const result = await runAgentCommand(command, args, cwd, agentEnv, prompt);
+
+          const parsed = adapterName === "claude" ? parseClaudeUsage(result.stdout) : {};
+
+          const responsePayload = {
+            exitCode: result.exitCode,
+            signal: null,
+            timedOut: false,
+            summary: parsed.summary || (result.exitCode === 0 ? "Remote execution completed" : "Remote execution failed"),
+            errorMessage: result.error || (result.exitCode !== 0 ? `Exited with code ${result.exitCode}` : null),
+            ...(parsed.usage ? { usage: parsed.usage } : {}),
+            ...(parsed.model ? { provider: "anthropic", model: parsed.model } : {}),
+            ...(parsed.costUsd ? { costUsd: parsed.costUsd } : {}),
+            resultJson: { stdout: result.stdout.slice(-8000), stderr: result.stderr.slice(-4000) },
+          };
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(responsePayload));
+          console.log(`[proxy] response sent`);
+        } catch (err) {
+          console.error(`[proxy] error:`, err);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ exitCode: 1, errorMessage: err.message }));
         }
+      });
+      return;
+    }
 
-        const agentEnv = {
-          ...process.env,
-          ...flatEnv,
-          PAPERCLIP_RUN_ID: runId,
-          PAPERCLIP_AGENT_ID: payload.agentId || "",
-          PAPERCLIP_COMPANY_ID: context.companyId || config.companyId || "",
-        };
+    res.writeHead(404);
+    res.end("Not Found\n");
+  });
 
-        const result = await runAgentCommand(command, args, cwd, agentEnv, prompt);
+  server.listen(PORT, "0.0.0.0", () => {
+    // already printed the banner above
+  });
+}
 
-        // Try to extract usage/model/cost from Claude's stream-json output
-        const parsed = adapterName === "claude" ? parseClaudeUsage(result.stdout) : {};
-
-        const responsePayload = {
-          exitCode: result.exitCode,
-          signal: null,
-          timedOut: false,
-          summary: parsed.summary || (result.exitCode === 0 ? "Remote execution completed" : "Remote execution failed"),
-          errorMessage: result.error || (result.exitCode !== 0 ? `Exited with code ${result.exitCode}` : null),
-          ...(parsed.usage ? { usage: parsed.usage } : {}),
-          ...(parsed.model ? { provider: "anthropic", model: parsed.model } : {}),
-          ...(parsed.costUsd ? { costUsd: parsed.costUsd } : {}),
-          resultJson: { stdout: result.stdout.slice(-8000), stderr: result.stderr.slice(-4000) },
-        };
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(responsePayload));
-        console.log(`[proxy] response sent`);
-      } catch (err) {
-        console.error(`[proxy] error:`, err);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ exitCode: 1, errorMessage: err.message }));
-      }
-    });
-    return;
-  }
-
-  res.writeHead(404);
-  res.end("Not Found\n");
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`
-${"=".repeat(54)}
- Paperclip Remote Agent Proxy  v1.0.0
-${"=".repeat(54)}
- Adapter : ${DEFAULT_ADAPTER}
- Listen  : http://0.0.0.0:${PORT}/heartbeat
- Health  : http://0.0.0.0:${PORT}/health
- CWD     : ${DEFAULT_CWD}
-${"=".repeat(54)}
-
- Setup in Paperclip UI:
- 1. Create agent -> select "${DEFAULT_ADAPTER} (remote)"
- 2. Set Remote URL to: http://<THIS_IP>:${PORT}/heartbeat
-${"=".repeat(54)}
-`);
-});
+main();
